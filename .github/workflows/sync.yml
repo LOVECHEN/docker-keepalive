@@ -1,0 +1,109 @@
+name: sync
+
+# 定时巡检 DockerHub 上本命名空间的公开镜像是否可正常拉取，并记录每次运行结果。
+
+on:
+  schedule:
+    - cron: '17 4 */3 * *'
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'DockerHub 命名空间'
+        default: 'lovechen'
+      time_budget:
+        description: '单次运行时间预算(秒)'
+        default: '18000'
+      min_sleep:
+        description: '每个镜像之间最短间隔(秒)'
+        default: '20'
+      max_sleep:
+        description: '每个镜像之间最长间隔(秒)'
+        default: '150'
+      max_images:
+        description: '单次最多检查数量(0=不限)'
+        default: '0'
+      platform:
+        description: '平台(留空=默认, 或 linux/amd64)'
+        default: ''
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Free up disk
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Fetch image list
+        run: |
+          NS="${{ github.event.inputs.namespace || 'lovechen' }}"
+          if python3 scripts/fetch_images.py "$NS" images.new && [ "$(wc -l < images.new)" -ge 10 ]; then
+            mv images.new images.txt
+          else
+            echo "::warning::list fetch failed, using bundled images.txt"
+            rm -f images.new
+          fi
+          echo "images: $(wc -l < images.txt)"
+
+      - name: Check images
+        env:
+          IMAGES_FILE: images.txt
+          TIME_BUDGET: ${{ github.event.inputs.time_budget || '18000' }}
+          MIN_SLEEP:   ${{ github.event.inputs.min_sleep   || '20' }}
+          MAX_SLEEP:   ${{ github.event.inputs.max_sleep   || '150' }}
+          MAX_IMAGES:  ${{ github.event.inputs.max_images  || '0' }}
+          PLATFORM:    ${{ github.event.inputs.platform    || '' }}
+        run: bash scripts/check.sh
+
+      - name: Record run
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.SYNC_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TS="$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+          mkdir -p state
+          {
+            echo "# last run"
+            echo
+            echo "- time: $TS"
+            echo "- run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > state/last_run.md
+
+          git config user.name  "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git add state/last_run.md images.txt 2>/dev/null || git add state/last_run.md
+
+          if git diff --cached --quiet; then
+            echo "no change"
+          elif [ -n "$GH_PAT" ]; then
+            git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_PAT" | base64)" \
+                commit -m "Update $TS" && \
+            git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_PAT" | base64)" \
+                push origin HEAD:${{ github.ref_name }}
+          else
+            git commit -m "Update $TS"
+            git push
+          fi
+
+          curl -sS -X PUT \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_PAT:-$GITHUB_TOKEN}" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/sync.yml/enable" \
+            -o /dev/null -w "enable %{http_code}\n" || true
