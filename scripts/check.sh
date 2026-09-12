@@ -34,6 +34,13 @@ echo "--------------------------------------------------------------------------
 
 PLAT_ARG=(); [ -n "$PLATFORM" ] && PLAT_ARG=(--platform "$PLATFORM")
 
+# 拉取一个 ref: 先默认平台; 未显式指定平台时再退回 arm64 (适配 arm64-only 镜像)
+try_pull() {
+  timeout "$PULL_TIMEOUT" docker pull "${PLAT_ARG[@]}" "$1" >/dev/null 2>&1 && return 0
+  [ -z "$PLATFORM" ] && timeout "$PULL_TIMEOUT" docker pull --platform linux/arm64 "$1" >/dev/null 2>&1 && return 0
+  return 1
+}
+
 for img in "${IMAGES[@]}"; do
   remain=$((DEADLINE - $(date +%s)))
   if [ "$remain" -le $((MAX_SLEEP + 60)) ]; then
@@ -47,11 +54,11 @@ for img in "${IMAGES[@]}"; do
 
   done=$((done + 1))
   echo "[$done/$TOTAL] $img"
-  if timeout "$PULL_TIMEOUT" docker pull "${PLAT_ARG[@]}" "$img:latest" >/dev/null 2>&1; then
+  if try_pull "$img:latest"; then
     ok=$((ok + 1)); tag="latest"
   else
     tag=$(python3 scripts/first_tag.py "$img" 2>/dev/null || true)
-    if [ -n "$tag" ] && timeout "$PULL_TIMEOUT" docker pull "${PLAT_ARG[@]}" "$img:$tag" >/dev/null 2>&1; then
+    if [ -n "$tag" ] && try_pull "$img:$tag"; then
       ok=$((ok + 1))
     else
       echo "     unavailable, skip"
